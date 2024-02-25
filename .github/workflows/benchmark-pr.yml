@@ -1,0 +1,247 @@
+name: Benchmark PR
+
+on:
+  workflow_call:
+    inputs:
+      node-versions:
+        type: string
+        default: "[18, 20, 21]"
+        required: false
+      benchmarks-dir:
+        type: string
+        required: true
+      files-to-ignore:
+        type: string
+        default: '[]'
+        required: false
+      bench-duration:
+        type: string
+        default: '5'
+        required: false
+      pr-repo: 
+        type: string
+        default: ${{ github.event.pull_request.head.repo.full_name }}
+        required: false
+      pr-sha:
+        type: string
+        default: ${{ github.event.pull_request.head.sha }}
+        required: false
+      pr-ref:
+        type: string
+        default: ${{ github.event.pull_request.head.ref }}
+        required: false
+      base-repo:
+        type: string
+        default: ${{ github.event.pull_request.base.repo.full_name }}
+        required: false
+      base-ref:
+        type: string
+        default: ${{ github.event.pull_request.base.ref }}
+        required: false
+      benchmark-script:
+        type: string
+        required: false
+        default: |
+          const { readdirSync, readFileSync, writeFileSync } = require('node:fs')
+          const { execSync } = require('node:child_process')
+
+          const benchmarkFiles = readdirSync(benchmarkDir)
+            .filter((fileName) => fileName.endsWith('.js') && !filesToIgnore.includes(fileName))
+
+          const results = {}
+
+          for (const benchmarkFile of benchmarkFiles) {
+            execSync(`echo "------- ${benchmarkFile}" >&2`)
+
+            const opts = readFileSync(`./${benchmarkDir}/${benchmarkFile}`, 'utf-8')
+              .split('\n')
+              .find((line) => line.startsWith('// autocannon-opts:'))
+              ?.replace('// autocannon-opts:', '')
+              ?? ''
+            
+            const stdout = execSync(`npx autocannon -c 100 -d ${benchDuration} -p 10 -j --on-port ${opts} localhost:3000 -- node ${benchmarkFile}`, {
+              cwd: `./${benchmarkDir}`
+            })
+
+            const output = JSON.parse(stdout.toString().split('\n').find((out) => out.startsWith('{"url')))
+
+            results[benchmarkFile] = output
+          }
+
+          writeFileSync(artifact, JSON.stringify(results))
+
+jobs:
+  benchmark:
+    if: ${{ github.event.label.name == 'benchmark' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        node-version: ${{ fromJSON(inputs.node-versions) }}
+        run-number: [ 1, 2, 3 ]
+    steps:
+      - name: "[${{ inputs.pr-repo }}@${{ inputs.pr-ref }}] Checkout"
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.pr-sha }}
+          repository: ${{ inputs.pr-repo }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install
+        run: npm install --ignore-scripts
+
+      - name: Run Benchmark
+        run: |
+          cat <<"END_OF_SCRIPT" | node
+          const benchmarkDir = './${{ inputs.benchmarks-dir}}'
+          const artifact = 'benchmarks-pr-${{ matrix.node-version }}-${{ matrix.run-number }}.json'
+          const filesToIgnore = JSON.parse('${{ inputs.files-to-ignore }}')
+          const benchDuration = ${{ inputs.bench-duration}}
+
+          ${{ inputs.benchmark-script }}
+          END_OF_SCRIPT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks-pr-${{ matrix.node-version }}-${{ matrix.run-number }}.json
+          path: benchmarks-pr-${{ matrix.node-version }}-${{ matrix.run-number }}.json
+
+      - name: "[${{ inputs.base-repo }}@${{ inputs.base-ref }}] Checkout"
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.base-ref }}
+          repository: ${{ inputs.base-repo }}
+
+      - name: Install
+        run: npm install --ignore-scripts
+
+      - name: Run Benchmark
+        run: |
+          cat <<"END_OF_SCRIPT" | node
+          const benchmarkDir = './${{ inputs.benchmarks-dir}}'
+          const artifact = 'benchmarks-base-${{ matrix.node-version }}-${{ matrix.run-number }}.json'
+          const filesToIgnore = JSON.parse('${{ inputs.files-to-ignore }}')
+          const benchDuration = ${{ inputs.bench-duration}}
+
+          ${{ inputs.benchmark-script }}
+          END_OF_SCRIPT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks-base-${{ matrix.node-version }}-${{ matrix.run-number }}.json
+          path: benchmarks-base-${{ matrix.node-version }}-${{ matrix.run-number }}.json
+
+  remove-label:
+    if: "always()"
+    needs: 
+      - benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove benchmark label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              name: 'benchmark'
+            })
+
+  output-benchmark:
+    needs:
+      - benchmark
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Comment PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { readdirSync, readFileSync } = require('node:fs')
+            const versions = JSON.parse('${{ inputs.node-versions }}')
+            const result = {}
+            const artifactFiles = readdirSync('.')
+            const warnings = []
+            for (const file of artifactFiles) {
+              const [, repo, version, runNumber] = file.match(/benchmarks-(.*)-(.*)-(.*).json/)
+              const artifact = JSON.parse(readFileSync(`./${file}`, 'utf-8'))
+              for (const [ benchmark, runResult ] of Object.entries(artifact)) {
+                if(!result[benchmark]) {
+                  result[benchmark] = {}
+                }
+                if(!result[benchmark][`${repo}-${version}`]) {
+                  result[benchmark][`${repo}-${version}`] = []
+                }
+                result[benchmark][`${repo}-${version}`].push(runResult.requests.mean)
+                if(runResult.non2xx > 0) {
+                  warnings.push(`Non-200 responses returned for ${benchmark} on ${repo} branch on Node ${version} (run ${runNumber})`)
+                }
+              }
+            }
+
+            const rows = []
+
+            const headerRow = ['Benchmark']
+            for(const version of versions) {
+              headerRow.push('')
+              headerRow.push(`Node ${version} PR`)
+              headerRow.push(`Node ${version} Base`)
+            }
+            rows.push(headerRow)
+
+            const blankRow = headerRow.map(() => '-')
+            rows.push(blankRow)
+
+            for(const benchmark of Object.keys(result)) {
+              const row = [benchmark]
+              for(const version of versions) {
+                row.push('')
+                const prFigure = Math.floor(Math.max(...result[benchmark][`pr-${version}`]) || 0)
+                const baseFigure = Math.floor(Math.max(...result[benchmark][`base-${version}`]) || 0)
+                if(baseFigure === 0 || (prFigure / baseFigure > 1.05)) {
+                  row.push(`**${prFigure}**`)
+                }
+                else {
+                  row.push(`${prFigure}`)
+                }
+                if(prFigure === 0 || (baseFigure / prFigure > 1.05)) {
+                  row.push(`**${baseFigure}**`)
+                }
+                else {
+                  row.push(`${baseFigure}`)
+                }
+              }
+              rows.push(row)
+            }
+
+            let comment = rows.map((row) => `|${row.join('|')}|`).join('\n')
+
+            if(warnings.length > 0) {
+              comment += '\n\n### Warnings'
+              for(const warning of warnings) {
+                comment += `\n- ${warning}`
+              }
+            }
+
+            console.log(`\n\n${comment}\n\n`)
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: comment
+            })
+
